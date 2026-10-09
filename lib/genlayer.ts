@@ -1,6 +1,6 @@
 import { createClient } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
-import { TransactionStatus } from "genlayer-js/types";
+import { ExecutionResult, TransactionHashVariant, TransactionStatus } from "genlayer-js/types";
 
 export const INCIDENT_QUORUM_CONTRACT_ADDRESS =
   (process.env.NEXT_PUBLIC_INCIDENT_QUORUM_CONTRACT_ADDRESS ??
@@ -21,6 +21,27 @@ export type IncidentInput = {
   contractAddress?: `0x${string}`;
 };
 
+export type AssessmentPhase =
+  | "wallet"
+  | "submitted"
+  | "consensus"
+  | "finalized"
+  | "readback";
+
+export type AssessmentProgress = {
+  phase: AssessmentPhase;
+  message: string;
+  hash?: string;
+  attempt?: number;
+  maxAttempts?: number;
+};
+
+export type AssessmentOptions = {
+  onProgress?: (progress: AssessmentProgress) => void;
+  readbackAttempts?: number;
+  readbackIntervalMs?: number;
+};
+
 function createReadClient(walletAddress?: WalletAddress) {
   return createClient({ chain: studionet, account: walletAddress });
 }
@@ -35,9 +56,10 @@ function address(override?: `0x${string}`) {
   return override ?? INCIDENT_QUORUM_CONTRACT_ADDRESS;
 }
 
-export async function assessIncident(input: IncidentInput) {
+export async function assessIncident(input: IncidentInput, options: AssessmentOptions = {}) {
   const client = createWriteClient(input.walletAddress);
   const contractAddress = address(input.contractAddress);
+  options.onProgress?.({ phase: "wallet", message: "Confirm the transaction in your wallet." });
   const hash = await client.writeContract({
     address: contractAddress,
     functionName: "assess_incident",
@@ -45,14 +67,40 @@ export async function assessIncident(input: IncidentInput) {
     value: BigInt(0),
     leaderOnly: false,
   });
+  options.onProgress?.({
+    phase: "submitted",
+    hash,
+    message: "Transaction submitted. Waiting for validator consensus.",
+  });
+  options.onProgress?.({
+    phase: "consensus",
+    hash,
+    message: "Validators are assessing the incident evidence.",
+  });
   const receipt = await client.waitForTransactionReceipt({
     hash,
-    status: TransactionStatus.ACCEPTED,
-    fullTransaction: true,
+    status: TransactionStatus.FINALIZED,
+    fullTransaction: false,
+  });
+  assertSuccessfulExecution(receipt);
+  options.onProgress?.({
+    phase: "finalized",
+    hash,
+    message: "Transaction finalized and GenVM execution succeeded.",
   });
   const receiptId = idFromReceipt(receipt);
-  const readback = await tryReadback(() => readIncidentReceipt(receiptId, contractAddress));
-  return { hash, receipt, receiptId, record: readback.data, readbackWarning: readback.warning };
+  const record = await pollIncidentReceipt(receiptId, contractAddress, {
+    attempts: options.readbackAttempts,
+    intervalMs: options.readbackIntervalMs,
+    onAttempt: (attempt, maxAttempts) => options.onProgress?.({
+      phase: "readback",
+      hash,
+      attempt,
+      maxAttempts,
+      message: `Reading on-chain receipt ${attempt}/${maxAttempts}.`,
+    }),
+  });
+  return { hash, receipt, receiptId, record };
 }
 
 export async function readIncidentReceipt(
@@ -60,13 +108,41 @@ export async function readIncidentReceipt(
   contractAddress: `0x${string}` = INCIDENT_QUORUM_CONTRACT_ADDRESS,
 ) {
   const client = createReadClient();
-  return client.readContract({
+  const result = await client.readContract({
     address: contractAddress,
     functionName: "get_receipt",
     args: [receiptId],
-    jsonSafeReturn: true,
-    leaderOnly: true,
+    transactionHashVariant: TransactionHashVariant.LATEST_FINAL,
   });
+  return normalizeIncidentRecord(result, receiptId);
+}
+
+export async function pollIncidentReceipt(
+  receiptId: string,
+  contractAddress: `0x${string}` = INCIDENT_QUORUM_CONTRACT_ADDRESS,
+  options: {
+    attempts?: number;
+    intervalMs?: number;
+    onAttempt?: (attempt: number, maxAttempts: number) => void;
+  } = {},
+) {
+  const attempts = Math.max(1, options.attempts ?? 20);
+  const intervalMs = Math.max(250, options.intervalMs ?? 2_500);
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    options.onAttempt?.(attempt, attempts);
+    try {
+      return await readIncidentReceipt(receiptId, contractAddress);
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await delay(intervalMs);
+    }
+  }
+
+  throw new Error(
+    `Transaction finalized, but receipt ${receiptId} was not readable after ${attempts} attempts: ${compactError(lastError)}`,
+  );
 }
 
 export async function readReceiptCount(
@@ -77,8 +153,7 @@ export async function readReceiptCount(
     address: contractAddress,
     functionName: "get_receipt_count",
     args: [],
-    jsonSafeReturn: true,
-    leaderOnly: true,
+    transactionHashVariant: TransactionHashVariant.LATEST_FINAL,
   });
 }
 
@@ -90,8 +165,7 @@ export async function readLatestReceiptId(
     address: contractAddress,
     functionName: "get_latest_receipt_id",
     args: [],
-    jsonSafeReturn: true,
-    leaderOnly: true,
+    transactionHashVariant: TransactionHashVariant.LATEST_FINAL,
   });
 }
 
@@ -120,16 +194,45 @@ function idFromReceipt(receipt: unknown): string {
   return id;
 }
 
+function assertSuccessfulExecution(receipt: unknown) {
+  const transaction = receipt as { txExecutionResultName?: ExecutionResult };
+  if (transaction.txExecutionResultName === ExecutionResult.FINISHED_WITH_RETURN) return;
+  if (transaction.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+    throw new Error("Transaction finalized, but GenVM execution failed. No incident receipt was written.");
+  }
+  throw new Error(
+    `Transaction finalized without a successful GenVM execution result (${transaction.txExecutionResultName ?? "NOT_VOTED"}).`,
+  );
+}
+
+function normalizeIncidentRecord(value: unknown, expectedReceiptId: string): string {
+  const text = typeof value === "string" ? value.trim() : JSON.stringify(value);
+  if (!text || text === '""' || text === "null" || text === "undefined") {
+    throw new Error(`Receipt ${expectedReceiptId} is not available on-chain yet.`);
+  }
+
+  let record: unknown;
+  try {
+    record = typeof value === "string" ? JSON.parse(value) : value;
+  } catch {
+    throw new Error(`Receipt ${expectedReceiptId} returned malformed contract data.`);
+  }
+  if (!record || typeof record !== "object") {
+    throw new Error(`Receipt ${expectedReceiptId} returned an invalid record.`);
+  }
+  const actualReceiptId = (record as Record<string, unknown>).receipt_id;
+  if (actualReceiptId !== expectedReceiptId) {
+    throw new Error(`Receipt readback mismatch: expected ${expectedReceiptId}, received ${String(actualReceiptId)}.`);
+  }
+  return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
 function collectStrings(value: unknown): string[] {
   if (typeof value === "string") return [value];
   if (!value || typeof value !== "object") return [];
   return Object.values(value as Record<string, unknown>).flatMap(collectStrings);
 }
 
-async function tryReadback<T>(read: () => Promise<T>): Promise<{ data: T | null; warning?: string }> {
-  try {
-    return { data: await read() };
-  } catch (error) {
-    return { data: null, warning: `The write was accepted, but immediate readback is still settling: ${compactError(error)}` };
-  }
+function delay(milliseconds: number) {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds));
 }

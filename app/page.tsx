@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { Activity, Clock3, ExternalLink, Link2, Plus, Search, ShieldCheck, Trash2, Wallet } from "lucide-react";
-import { INCIDENT_QUORUM_CONTRACT_ADDRESS, INCIDENT_QUORUM_EXPLORER, assessIncident, compactError } from "@/lib/genlayer";
+import { AssessmentPhase, INCIDENT_QUORUM_CONTRACT_ADDRESS, INCIDENT_QUORUM_EXPLORER, assessIncident, compactError } from "@/lib/genlayer";
 
 declare global {
   interface Window {
@@ -27,6 +27,8 @@ export default function Home() {
   const [receiptId, setReceiptId] = useState("");
   const [record, setRecord] = useState("");
   const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState<AssessmentPhase | "ready" | "success" | "failed">("ready");
+  const [transactionHash, setTransactionHash] = useState("");
 
   const canSubmit = useMemo(
     () => Boolean(serviceName.trim() && serviceUrl.trim() && sources.filter(Boolean).length >= 2 && !busy),
@@ -61,7 +63,9 @@ export default function Home() {
     setBusy(true);
     setReceiptId("");
     setRecord("");
-    setStatus("Waiting for wallet approval and validator consensus...");
+    setTransactionHash("");
+    setPhase("wallet");
+    setStatus("Waiting for wallet confirmation...");
     try {
       if (!window.ethereum) throw new Error("No browser wallet detected.");
       let activeWallet = wallet;
@@ -71,18 +75,29 @@ export default function Home() {
         if (!activeWallet) throw new Error("Connect a wallet before submitting.");
         setWallet(activeWallet);
       }
-      const result = await assessIncident({
-        walletAddress: activeWallet as `0x${string}`,
-        serviceName,
-        serviceUrl,
-        windowStartUtc,
-        windowEndUtc,
-        sourceUrls: sources.map((source) => source.trim()).filter(Boolean),
-      });
+      const result = await assessIncident(
+        {
+          walletAddress: activeWallet as `0x${string}`,
+          serviceName,
+          serviceUrl,
+          windowStartUtc,
+          windowEndUtc,
+          sourceUrls: sources.map((source) => source.trim()).filter(Boolean),
+        },
+        {
+          onProgress: (progress) => {
+            setPhase(progress.phase);
+            setStatus(progress.message);
+            if (progress.hash) setTransactionHash(progress.hash);
+          },
+        },
+      );
       setReceiptId(result.receiptId);
-      setRecord(typeof result.record === "string" ? result.record : JSON.stringify(result.record, null, 2));
-      setStatus("Accepted by GenLayer consensus and read back from the contract.");
+      setRecord(result.record);
+      setPhase("success");
+      setStatus("Finalized successfully. The matching receipt was read back from the contract.");
     } catch (error) {
+      setPhase("failed");
       setStatus(compactError(error));
     } finally {
       setBusy(false);
@@ -145,14 +160,15 @@ export default function Home() {
 
           <aside className="receipt-panel">
             <div className="receipt-title"><span>LIVE RECEIPT</span><Activity size={18} /></div>
-            <div className={`status-block ${receiptId ? "accepted" : ""}`}>
+            <div className={`status-block ${phase === "success" ? "accepted" : phase === "failed" ? "failed" : busy ? "pending" : ""}`}>
               <span className="status-dot" />
-              <div><small>STATUS</small><strong>{receiptId ? "ACCEPTED" : busy ? "IN CONSENSUS" : "READY"}</strong></div>
+              <div><small>STATUS</small><strong>{phaseLabel(phase)}</strong></div>
             </div>
             <dl className="receipt-meta">
               <div><dt>Network</dt><dd>GenLayer Studionet</dd></div>
               <div><dt>Contract</dt><dd title={INCIDENT_QUORUM_CONTRACT_ADDRESS}>{compactAddress(INCIDENT_QUORUM_CONTRACT_ADDRESS)}</dd></div>
               <div><dt>Sources</dt><dd>{sources.filter(Boolean).length}</dd></div>
+              <div><dt>Transaction</dt><dd title={transactionHash}>{transactionHash ? compactAddress(transactionHash) : "Not submitted"}</dd></div>
               <div><dt>Receipt ID</dt><dd>{receiptId || "Pending"}</dd></div>
             </dl>
             <div className="console-message">{status}</div>
@@ -179,4 +195,18 @@ function Field({ label, value, onChange, placeholder, icon }: { label: string; v
 
 function compactAddress(value: string) {
   return value.length > 13 ? `${value.slice(0, 7)}...${value.slice(-5)}` : value;
+}
+
+function phaseLabel(phase: AssessmentPhase | "ready" | "success" | "failed") {
+  const labels = {
+    ready: "READY",
+    wallet: "WALLET CONFIRMATION",
+    submitted: "SUBMITTED",
+    consensus: "IN CONSENSUS",
+    finalized: "GENVM SUCCEEDED",
+    readback: "READING RECEIPT",
+    success: "SUCCESS",
+    failed: "FAILED",
+  };
+  return labels[phase];
 }

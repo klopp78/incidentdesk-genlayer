@@ -14,6 +14,7 @@
     "contract:check": "node scripts/check-contract.mjs",
     "contract:test": "node scripts/test-contract-lifecycle.mjs",
     "flow:check": "node scripts/check-full-flow.mjs",
+    "e2e:deployed": "node scripts/verify-deployed-receipt.mjs",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

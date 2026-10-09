@@ -31,7 +31,7 @@ export default function RecordsPage() {
     setStatus("Reading the accepted record from GenLayer...");
     try {
       const result = await readIncidentReceipt(id.trim());
-      setRecord(typeof result === "string" ? result : JSON.stringify(result, null, 2));
+      setRecord(result);
       setReceiptId(id.trim());
       setStatus("Receipt read directly from the deployed contract.");
     } catch (error) {
@@ -46,6 +46,7 @@ export default function RecordsPage() {
     setStatus("Locating the latest accepted receipt...");
     try {
       const latest = String(await readLatestReceiptId());
+      if (!/^inq_[a-f0-9]{20}$/.test(latest)) throw new Error("The contract did not return a valid latest receipt ID.");
       setReceiptId(latest);
       await load(latest);
     } catch (error) {

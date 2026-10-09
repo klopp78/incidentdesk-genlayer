@@ -66,8 +66,11 @@ button { color:inherit; }
 .receipt-title svg { color:var(--cyan); }
 .status-block { align-items:center; background:#171c21; border:1px solid var(--line); border-radius:6px; display:flex; gap:12px; margin:17px 0; padding:14px; }
 .status-block.accepted { background:rgba(184,239,116,.06); border-color:rgba(184,239,116,.35); }
+.status-block.pending { background:rgba(255,172,102,.06); border-color:rgba(255,172,102,.35); }
+.status-block.failed { background:rgba(255,114,114,.06); border-color:rgba(255,114,114,.4); }
 .status-dot { background:var(--orange); border-radius:50%; height:9px; width:9px; }
 .status-block.accepted .status-dot { background:var(--lime); }
+.status-block.failed .status-dot { background:var(--danger); }
 .status-block small, .count-block small { color:var(--muted); display:block; font-size:9px; margin-bottom:4px; }
 .status-block strong { font-family:Consolas, monospace; font-size:12px; }
 .receipt-meta { margin:0; }
